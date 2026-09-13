@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- MacZip 官网分发路线主 App：非 sandbox。
+         仅声明 App Group，供主 App 与 Finder 扩展 / QuickLook 扩展共享配置与密码本。 -->
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.wzl.MacZip</string>
+    </array>
+</dict>
+</plist>
