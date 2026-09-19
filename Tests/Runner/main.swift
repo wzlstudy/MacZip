@@ -296,6 +296,51 @@ expectEqual(ArchiveFormat.detect(url: URL(fileURLWithPath: "/x/a.gz")), ArchiveF
 expectEqual(ArchiveFormat.detect(url: URL(fileURLWithPath: "/x/vol.zip.001")), ArchiveFormat.splitVolume, "分卷")
 expectTrue(ArchiveFormat.detect(url: URL(fileURLWithPath: "/x/a.txt")) == nil, "非压缩包")
 
+// MARK: - 7b. 默认压缩包命名
+
+print("默认压缩包命名")
+do {
+    let dottedDirectory = work.appendingPathComponent("0.0.203", isDirectory: true)
+    try fm.createDirectory(at: dottedDirectory, withIntermediateDirectories: true)
+    try "content".write(
+        to: dottedDirectory.appendingPathComponent("file.txt"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let directoryOutput = ArchiveService.defaultOutputURL(
+        for: [dottedDirectory],
+        format: .zip
+    )
+    expectEqual(directoryOutput.lastPathComponent, "0.0.203.zip", "带点号目录保留完整名称")
+
+    let file = work.appendingPathComponent("foo.tar.gz")
+    fm.createFile(atPath: file.path, contents: Data())
+    let fileOutput = ArchiveService.defaultOutputURL(for: [file], format: .zip)
+    expectEqual(fileOutput.lastPathComponent, "foo.tar.zip", "文件仅去掉最后一级扩展名")
+
+    let multiRoot = work.appendingPathComponent("multi-root", isDirectory: true)
+    try fm.createDirectory(at: multiRoot, withIntermediateDirectories: true)
+    let multiOutput = ArchiveService.defaultOutputURL(
+        for: [
+            multiRoot.appendingPathComponent("one"),
+            multiRoot.appendingPathComponent("two")
+        ],
+        format: .zip
+    )
+    expectEqual(multiOutput.lastPathComponent, "multi-root.zip", "多选使用父目录名")
+
+    let actualOutput = try ArchiveService.shared.compress(
+        inputs: [dottedDirectory],
+        output: directoryOutput,
+        format: .zip,
+        reporter: NullProgressReporter()
+    )
+    expectEqual(actualOutput.lastPathComponent, "0.0.203.zip", "实际压缩产物保留目录完整名称")
+} catch {
+    expectTrue(false, "默认压缩包命名异常: \(error)")
+}
+
 // MARK: - 8. 密码本
 
 print("密码本")
@@ -319,11 +364,42 @@ do {
 // MARK: - 9. 动作可用性
 
 print("动作可用性")
-let archiveURL = URL(fileURLWithPath: "/tmp/fake.zip")
-expectTrue(DefaultActionRegistry.ExtractHere().isAvailable(for: [archiveURL], isContainer: false), "压缩包可解压")
-expectTrue(!DefaultActionRegistry.ExtractHere().isAvailable(for: [URL(fileURLWithPath: "/tmp/fake.txt")], isContainer: false), "普通文件不可解压")
-expectTrue(!DefaultActionRegistry.ExtractHere().isAvailable(for: [archiveURL], isContainer: true), "空白背景不可解压")
-expectTrue(DefaultActionRegistry.CompressDefault().isAvailable(for: [archiveURL], isContainer: false), "任何目标可压缩")
+do {
+    let source = work.appendingPathComponent("action-source", isDirectory: true)
+    try fm.createDirectory(at: source, withIntermediateDirectories: true)
+    try "valid archive".write(
+        to: source.appendingPathComponent("payload.txt"),
+        atomically: true,
+        encoding: .utf8
+    )
+    let archiveURL = work.appendingPathComponent("valid-action.zip")
+    _ = try ZipWriter(options: .init(level: .store), reporter: NullProgressReporter())
+        .write(inputs: [source], to: archiveURL)
+
+    expectTrue(DefaultActionRegistry.ExtractHere().isAvailable(for: [archiveURL], isContainer: false), "真实压缩包可解压")
+
+    let fakeZip = work.appendingPathComponent("fake.zip")
+    try Data("not a zip archive".utf8).write(to: fakeZip)
+    expectTrue(
+        !DefaultActionRegistry.ExtractHere().isAvailable(for: [fakeZip], isContainer: false),
+        "普通文件改名为 zip 不显示解压"
+    )
+
+    let directoryNamedZip = work.appendingPathComponent("folder.zip", isDirectory: true)
+    try fm.createDirectory(at: directoryNamedZip, withIntermediateDirectories: true)
+    expectTrue(
+        !DefaultActionRegistry.ExtractHere().isAvailable(for: [directoryNamedZip], isContainer: false),
+        "目录名带 zip 后缀不显示解压"
+    )
+
+    expectTrue(
+        !DefaultActionRegistry.ExtractHere().isAvailable(for: [archiveURL], isContainer: true),
+        "空白背景不可解压"
+    )
+    expectTrue(DefaultActionRegistry.CompressDefault().isAvailable(for: [archiveURL], isContainer: false), "任何目标可压缩")
+} catch {
+    expectTrue(false, "动作可用性异常: \(error)")
+}
 
 // MARK: - 9b. 文件名编码 (GBK → GB18030 回退)
 
@@ -345,6 +421,69 @@ do {
     expectEqual(ZipEntryNameDecoder.decode(utf8, isUTF8Declared: true), "中文名.txt", "EFS 置位按 UTF-8")
     expectEqual(ZipEntryNameDecoder.decode(utf8, isUTF8Declared: false), "中文名.txt", "未置位但合法 UTF-8 仍按 UTF-8")
     expectEqual(ZipEntryNameDecoder.decode(Data("readme.txt".utf8), isUTF8Declared: false), "readme.txt", "ASCII 名称不受影响")
+}
+
+// MARK: - 9c. 解压计划 (冲突重命名 / 跳过)
+
+print("解压计划")
+do {
+    let source = work.appendingPathComponent("plan-src", isDirectory: true)
+    try fm.createDirectory(at: source, withIntermediateDirectories: true)
+    try "archive payload".write(
+        to: source.appendingPathComponent("payload.txt"),
+        atomically: true,
+        encoding: .utf8
+    )
+    let archive = work.appendingPathComponent("plan.zip")
+    try ZipWriter(options: .init(level: .store), reporter: NullProgressReporter())
+        .write(inputs: [source], to: archive)
+
+    let existing = "existing payload"
+    let renameOut = work.appendingPathComponent("plan-rename-out", isDirectory: true)
+    try fm.createDirectory(
+        at: renameOut.appendingPathComponent("plan-src"),
+        withIntermediateDirectories: true
+    )
+    try existing.write(
+        to: renameOut.appendingPathComponent("plan-src/payload.txt"),
+        atomically: true,
+        encoding: .utf8
+    )
+    _ = try ZipReader(archiveURL: archive).extractAll(
+        options: .init(destination: renameOut, conflictPolicy: .rename),
+        reporter: NullProgressReporter()
+    )
+    expectEqual(
+        try String(contentsOf: renameOut.appendingPathComponent("plan-src/payload.txt"), encoding: .utf8),
+        existing,
+        "rename 不覆盖已有文件"
+    )
+    expectEqual(
+        try String(contentsOf: renameOut.appendingPathComponent("plan-src/payload 2.txt"), encoding: .utf8),
+        "archive payload",
+        "rename 生成稳定的新文件名"
+    )
+
+    let skipOut = work.appendingPathComponent("plan-skip-out", isDirectory: true)
+    try fm.createDirectory(
+        at: skipOut.appendingPathComponent("plan-src"),
+        withIntermediateDirectories: true
+    )
+    try existing.write(
+        to: skipOut.appendingPathComponent("plan-src/payload.txt"),
+        atomically: true,
+        encoding: .utf8
+    )
+    _ = try ZipReader(archiveURL: archive).extractAll(
+        options: .init(destination: skipOut, conflictPolicy: .skip),
+        reporter: NullProgressReporter()
+    )
+    expectTrue(
+        !fm.fileExists(atPath: skipOut.appendingPathComponent("plan-src/payload 2.txt").path),
+        "skip 不产生新文件"
+    )
+} catch {
+    expectTrue(false, "解压计划异常: \(error)")
 }
 
 // MARK: - 10. 层级树模型 (预览窗口 / QuickLook 共用)

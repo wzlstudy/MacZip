@@ -2,6 +2,19 @@ import Foundation
 import AppKit
 import Quartz
 
+private final class ArchiveMoreChildrenNode: NSObject {
+    let parent: ZipEntryNode?
+    let offset: Int
+    let remaining: Int
+
+    init(parent: ZipEntryNode?, offset: Int, remaining: Int) {
+        self.parent = parent
+        self.offset = offset
+        self.remaining = remaining
+        super.init()
+    }
+}
+
 /// 压缩包内容预览窗口 (双击 zip 打开 / 设置里选"预览"时的呈现载体)。
 /// 纯 AppKit 实现,与 QuickLook 扩展共用同一套解析管线 (MacZipCore.ZipReader)
 /// 与层级树模型 (MacZipCore.ZipEntryTree)。
@@ -16,7 +29,9 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
     private static var activeControllers: [ArchivePreviewWindowController] = []
     /// 首个窗口恢复上次框架位置,后续窗口居中 (避免多窗口争用同一 frame autosave)。
     private static var primaryWindowFrameRestored = false
-    private static let frameAutosaveName = "MacZipPreviewWindow"
+    // 升级保存键,避免旧版本保存的超宽窗口尺寸继续影响新布局。
+    private static let frameAutosaveName = "MacZipPreviewWindowV2"
+    private static let columnsAutosaveName = "MacZipArchivePreviewColumnsV2"
 
     /// 打开 (或聚焦) 一个压缩包的内容预览窗口。同一压缩包已打开时置前复用,
     /// 不同压缩包各自开新窗口。须在主线程调用。
@@ -42,6 +57,9 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
     private var roots: [ZipEntryNode] = []
     /// 当前展示的树 (搜索过滤后,无关键字时同 roots)。
     private var visibleRoots: [ZipEntryNode] = []
+    /// 每个目录当前允许展示的直接子项数量;超出部分通过"显示更多"分页。
+    private var loadedChildCounts: [String: Int] = [:]
+    private var archiveEntryCount = 0
     /// 底部状态栏的压缩包摘要 (不含选择状态)。
     private var archiveSummary = ""
 
@@ -57,7 +75,21 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
     private var extractButton: NSButton!
     private var deleteButton: NSButton!
     private var commentButton: NSButton!
+    private var expandAllButton: NSButton!
+    private var collapseAllButton: NSButton!
     private weak var cleanButtonRef: NSButton?
+
+    /// 文字按钮的图标态规格 (空间不足时按钮退化为纯图标,tooltip 保留名称)。
+    private struct ActionButtonSpec {
+        let button: NSButton
+        let title: String
+        let symbol: String
+    }
+    private var actionBarSpecs: [ActionButtonSpec] = []
+    /// 当前是否为文字按钮形态。
+    private var actionButtonsShowText = true
+    /// 文字形态下整行工具区所需的最小内容宽度 (构建时实测)。
+    private var textModeRequiredWidth: CGFloat = 0
 
     // MARK: 预览面板
     private var splitView: NSSplitView!
@@ -82,21 +114,38 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
     private var resolvedPassword: String?
     /// 异步解压代际标记:选中项已变化时丢弃过期结果。
     private var previewToken = UUID()
+    /// 清单异步加载代际标记:切换压缩包或重新加载后丢弃旧结果。
+    private var archiveLoadToken = UUID()
+    private var archiveLoadWorkItem: DispatchWorkItem?
+    private var searchWorkItem: DispatchWorkItem?
+    private var searchToken = UUID()
+    private var listDocumentWidthConstraint: NSLayoutConstraint!
+    private var listDocumentHeightConstraint: NSLayoutConstraint!
     private var didSetInitialSplit = false
 
     /// 头部搜索框高度 (alignment rect)。rounded 按钮的边框视觉高度固定且不随约束
     /// 伸缩,实测把搜索框钉到 22pt 时两者渲染边缘逐像素重合,故不用按钮的 24pt 名义值。
     private static let searchFieldHeight: CGFloat = 22
+    private static let searchFieldWidth: CGFloat = 160
+    /// 文字按钮形态下标题保底的可读宽度 (再窄就切换图标态)。
+    private static let textModeTitleWidth: CGFloat = 140
     /// 底部状态栏高度。
     private static let footerHeight: CGFloat = 30
     /// 单文件内容预览上限:超过则只展示元信息,避免为超大条目解压占用大量磁盘/时间。
     private static let previewSizeLimit: UInt64 = 200 * 1024 * 1024
-    /// 分隔条两侧最小宽度。名称列可收缩至 100,四列固定部分约 326 + 列间距,
-    /// 故 500 可完整容纳且保持紧凑。
-    private static let minListWidth: CGFloat = 500
-    private static let minPreviewWidth: CGFloat = 200
+    /// 分隔条两侧最小宽度,保证名称列和三列辅助信息仍具备基本可读空间。
+    private static let minListWidth: CGFloat = 580
+    private static let minPreviewWidth: CGFloat = 340
     /// 首次展示时分隔条位置 (列表占比)。
-    private static let initialListRatio: CGFloat = 0.64
+    private static let initialListRatio: CGFloat = 0.58
+    private static let defaultWindowSize = NSSize(width: 1040, height: 640)
+    private static let minWindowSize = NSSize(width: 920, height: 540)
+    private static let maxWindowSize = NSSize(width: 1400, height: 900)
+    /// 小型归档可以自动展开顶层目录;大归档保持折叠,避免打开即生成数万行。
+    private static let automaticExpansionEntryLimit = 500
+    /// 大目录按页呈现,避免一次展开创建数万条可见行。
+    private static let childPageSize = 400
+    private static let rootChildrenKey = ""
 
     private let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -106,15 +155,16 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
 
     convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 880, height: 520),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            contentRect: NSRect(origin: .zero, size: Self.defaultWindowSize),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        window.isMovableByWindowBackground = true
-        window.minSize = NSSize(width: 760, height: 400)
+        window.titlebarAppearsTransparent = false
+        window.isMovableByWindowBackground = false
+        window.minSize = Self.minWindowSize
+        window.maxSize = Self.maxWindowSize
         self.init(window: window)
         window.delegate = self
         buildUI()
@@ -152,9 +202,25 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
         let cleanButton = makeTextButton("清理", action: #selector(cleanClicked))
         cleanButtonRef = cleanButton
         commentButton = makeTextButton("注释", action: #selector(commentClicked))
+        // 全部展开/折叠:常驻图标按钮 (窄窗口下与动作按钮同为图标态,语义靠 tooltip)。
+        expandAllButton = makeIconButton(
+            symbol: "chevron.down.square", title: "全部展开", action: #selector(expandAllClicked)
+        )
+        collapseAllButton = makeIconButton(
+            symbol: "chevron.up.square", title: "全部折叠", action: #selector(collapseAllClicked)
+        )
 
         extractButton.isEnabled = false
         deleteButton.isEnabled = false
+
+        actionBarSpecs = [
+            ActionButtonSpec(button: addButton, title: "增加", symbol: "plus.circle"),
+            ActionButtonSpec(button: extractButton, title: "提取", symbol: "tray.and.arrow.down"),
+            ActionButtonSpec(button: extractAllButton, title: "全部解压", symbol: "archivebox"),
+            ActionButtonSpec(button: deleteButton, title: "删除", symbol: "trash"),
+            ActionButtonSpec(button: cleanButton, title: "清理", symbol: "sparkles"),
+            ActionButtonSpec(button: commentButton, title: "注释", symbol: "note.text")
+        ]
 
         searchField = NSSearchField()
         searchField.placeholderString = "搜索文件"
@@ -170,14 +236,20 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
         spacer.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
         spacer.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: .horizontal)
 
+        // 单行头部:左侧标题区,右侧 全部展开/折叠 + 动作按钮 + 搜索框,
+        // 整组右缘与搜索框对齐;窗口变窄时动作按钮自动退化为纯图标 (applyActionMode)。
         let header = NSStackView(views: [
             headerIcon, titleStack, spacer,
+            expandAllButton, collapseAllButton,
             addButton, extractButton, extractAllButton, deleteButton, cleanButton, commentButton,
             searchField
         ])
         header.orientation = .horizontal
         header.alignment = .centerY
         header.spacing = 8
+        // 展开折叠组、动作按钮组与搜索框之间稍作呼吸分隔。
+        header.setCustomSpacing(12, after: collapseAllButton)
+        header.setCustomSpacing(12, after: commentButton)
         header.translatesAutoresizingMaskIntoConstraints = false
 
         let divider = NSView()
@@ -190,46 +262,71 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
         outlineView.style = .inset
         outlineView.rowHeight = 22
         outlineView.indentationPerLevel = 12
-        outlineView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        // 关闭自动列宽重分配,四列宽度完全由用户控制。
+        // 否则窗口布局会把用户刚拖出的宽度再次改回去。
+        outlineView.columnAutoresizingStyle = .noColumnAutoresizing
+        outlineView.allowsColumnResizing = true
+        outlineView.allowsColumnReordering = false
+        outlineView.autoresizesOutlineColumn = false
+        outlineView.autosaveName = Self.columnsAutosaveName
+        outlineView.autosaveTableColumns = true
         outlineView.allowsMultipleSelection = true
         outlineView.allowsEmptySelection = true
         outlineView.usesAlternatingRowBackgroundColors = false
+        // 内容区不画竖向网格线;列边界只由表头短刻度提示。
+        outlineView.gridStyleMask = []
+        // .inset 样式默认 intercellSpacing.width 高达 17pt,会把内容 cell 视图
+        // 从列矩形左右各内缩 8.5pt,而表头按整列绘制,造成"表头左对齐列偏左、
+        // 右对齐列偏右"的错位。置 0 后内容 cell 与列矩形重合,表头与内容用同一
+        // 套内边距即可像素级对齐;行间距保留 2pt,相邻选中行的高亮不会粘连。
+        outlineView.intercellSpacing = NSSize(width: 0, height: 2)
 
         let nameColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
-        nameColumn.width = 200
-        nameColumn.minWidth = 100
-        nameColumn.resizingMask = .autoresizingMask
+        nameColumn.width = 250
+        nameColumn.minWidth = 180
+        nameColumn.maxWidth = 1200
+        nameColumn.resizingMask = [.userResizingMask]
         nameColumn.title = "名称"
+        // 表头内边距与内容 cell 一致 (8pt),保证标题与正文像素级对齐。
+        nameColumn.headerCell = FlatTableHeaderCell(title: "名称", alignment: .left, leadingInset: 8)
         outlineView.addTableColumn(nameColumn)
         let sizeColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("size"))
-        sizeColumn.width = 80
-        sizeColumn.minWidth = 80
-        sizeColumn.maxWidth = 80
-        sizeColumn.resizingMask = []
+        sizeColumn.width = 84
+        sizeColumn.minWidth = 72
+        sizeColumn.maxWidth = 180
+        sizeColumn.resizingMask = [.userResizingMask]
         sizeColumn.title = "大小"
+        sizeColumn.headerCell = FlatTableHeaderCell(title: "大小", alignment: .right, trailingInset: 8)
         outlineView.addTableColumn(sizeColumn)
         let dateColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("date"))
-        dateColumn.width = 118
-        dateColumn.minWidth = 118
-        dateColumn.maxWidth = 118
-        dateColumn.resizingMask = []
+        dateColumn.width = 132
+        dateColumn.minWidth = 110
+        dateColumn.maxWidth = 240
+        dateColumn.resizingMask = [.userResizingMask]
         dateColumn.title = "修改日期"
+        dateColumn.headerCell = FlatTableHeaderCell(title: "修改日期", alignment: .right, trailingInset: 8)
         outlineView.addTableColumn(dateColumn)
         let kindColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("kind"))
-        kindColumn.width = 96
-        kindColumn.minWidth = 96
-        kindColumn.maxWidth = 96
-        kindColumn.resizingMask = []
+        kindColumn.width = 100
+        kindColumn.minWidth = 80
+        kindColumn.maxWidth = 180
+        kindColumn.resizingMask = [.userResizingMask]
         kindColumn.title = "种类"
+        kindColumn.headerCell = FlatTableHeaderCell(title: "种类", alignment: .left, leadingInset: 8)
         outlineView.addTableColumn(kindColumn)
 
         outlineView.outlineTableColumn = nameColumn
-        outlineView.headerView = FlatTableHeaderView()
+        let tableHeader = FlatTableHeaderView(
+            frame: NSRect(
+                x: 0,
+                y: 0,
+                width: 0,
+                height: FlatTableHeaderView.preferredHeight
+            )
+        )
+        tableHeader.autoresizingMask = [.width]
+        outlineView.headerView = tableHeader
         self.nameColumn = nameColumn
-        nameColumn.headerCell.alignment = .left
-        sizeColumn.headerCell.alignment = .right
-        dateColumn.headerCell.alignment = .right
-        kindColumn.headerCell.alignment = .left
         outlineView.dataSource = self
         outlineView.delegate = self
         outlineView.target = self
@@ -245,16 +342,26 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
         scrollView.documentView = outlineView
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
-        scrollView.hasHorizontalScroller = false
+        scrollView.hasHorizontalScroller = true
+        scrollView.horizontalScrollElasticity = .automatic
         scrollView.drawsBackground = false
         scrollView.translatesAutoresizingMaskIntoConstraints = false
+        let fillDocumentWidth = outlineView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor)
+        fillDocumentWidth.priority = NSLayoutConstraint.Priority(750)
         NSLayoutConstraint.activate([
-            outlineView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor)
+            fillDocumentWidth
         ])
-        // 保证紧凑窗口下列表仍有最小可读宽度。
-        let listMinWidth = scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: Self.minListWidth)
-        listMinWidth.priority = NSLayoutConstraint.Priority(999)
-        listMinWidth.isActive = true
+        // 列宽总和超过可视区时保留真实文档宽度,由横向滚动条承载;
+        // 窗口变宽时低优先级等宽约束仍会让列表填满可视区。
+        let initialDocumentWidth = tableWidthRequiredByColumns()
+        listDocumentWidthConstraint = outlineView.widthAnchor.constraint(
+            greaterThanOrEqualToConstant: initialDocumentWidth
+        )
+        listDocumentWidthConstraint.priority = NSLayoutConstraint.Priority(999)
+        listDocumentWidthConstraint.isActive = true
+        listDocumentHeightConstraint = outlineView.heightAnchor.constraint(equalToConstant: 600)
+        listDocumentHeightConstraint.priority = NSLayoutConstraint.Priority(999)
+        listDocumentHeightConstraint.isActive = true
 
         previewContainer = buildPreviewPane()
 
@@ -285,14 +392,14 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
         footer.addSubview(pathLabel)
 
         NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 30),
+            header.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 14),
             header.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
             header.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
             headerIcon.widthAnchor.constraint(equalToConstant: 26),
             headerIcon.heightAnchor.constraint(equalToConstant: 26),
 
             searchField.heightAnchor.constraint(equalToConstant: Self.searchFieldHeight),
-            searchField.widthAnchor.constraint(equalToConstant: 160),
+            searchField.widthAnchor.constraint(equalToConstant: Self.searchFieldWidth),
 
             divider.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 12),
             divider.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
@@ -313,6 +420,65 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
             pathLabel.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -16),
             pathLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor)
         ])
+
+        // 实测文字形态所需宽度,并按当前窗口尺寸决定初始形态。
+        textModeRequiredWidth = measureActionBarWidth(textMode: true)
+        applyActionMode(text: true)
+        updateActionButtonMode()
+    }
+
+    // MARK: - 工具栏两态 (文字 / 图标)
+
+    /// 窗口宽度足够时显示文字按钮;不足时动作按钮退化为纯图标 (tooltip 保留名称),
+    /// 回到宽窗口再恢复文字。带 24pt 滞后区间,避免临界宽度附近来回抖动。
+    private func updateActionButtonMode() {
+        guard textModeRequiredWidth > 0, let contentView = window?.contentView else { return }
+        if actionButtonsShowText {
+            if contentView.bounds.width < textModeRequiredWidth {
+                applyActionMode(text: false)
+            }
+        } else if contentView.bounds.width >= textModeRequiredWidth + 24 {
+            applyActionMode(text: true)
+        }
+    }
+
+    private func applyActionMode(text: Bool) {
+        actionButtonsShowText = text
+        for spec in actionBarSpecs {
+            spec.button.toolTip = spec.title
+            if text {
+                spec.button.image = nil
+                spec.button.imagePosition = .noImage
+                spec.button.title = spec.title
+            } else {
+                spec.button.title = ""
+                if let image = NSImage(systemSymbolName: spec.symbol, accessibilityDescription: spec.title) {
+                    spec.button.image = image
+                    spec.button.imagePosition = .imageOnly
+                } else {
+                    // 符号不可用 (系统过旧) 时保留文字,仅失去图标形态。
+                    spec.button.title = spec.title
+                    spec.button.imagePosition = .noImage
+                }
+            }
+        }
+    }
+
+    /// 测量指定形态下头部整行所需的内容宽度 (含头部左右 16pt 留白)。
+    private func measureActionBarWidth(textMode: Bool) -> CGFloat {
+        let previous = actionButtonsShowText
+        applyActionMode(text: textMode)
+        defer { applyActionMode(text: previous) }
+
+        var width = CGFloat(26 + 8)  // 归档图标 + 间距
+        width += Self.textModeTitleWidth + 16  // 标题最小可读宽度 + 弹性空隙
+        width += expandAllButton.fittingSize.width + 8
+        width += collapseAllButton.fittingSize.width + 12
+        for spec in actionBarSpecs {
+            width += spec.button.fittingSize.width + 8
+        }
+        width += Self.searchFieldWidth + 32
+        return width
     }
 
     /// 右侧内容预览面板:文件信息条 + QuickLook 内容视图 + 状态占位。
@@ -414,6 +580,18 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
         return button
     }
 
+    private func makeIconButton(symbol: String, title: String, action: Selector) -> NSButton {
+        let button = NSButton(title: "", target: self, action: action)
+        button.bezelStyle = .rounded
+        button.controlSize = .regular
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        button.imagePosition = .imageOnly
+        button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+        button.toolTip = title
+        button.translatesAutoresizingMaskIntoConstraints = false
+        return button
+    }
+
     private func makeContextMenu() -> NSMenu {
         let menu = NSMenu()
         menu.addItem(withTitle: "提取…", action: #selector(extractSelectedClicked), keyEquivalent: "")
@@ -455,8 +633,10 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
         } else {
             window.center()
         }
+        normalizeWindowFrame()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        updateActionButtonMode()
 
         searchField.stringValue = ""
         didSetInitialSplit = false
@@ -471,54 +651,83 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
     /// 重新解析当前压缩包并刷新界面 (内容编辑后调用)。
     private func reloadArchive(preserveSearch: Bool = true) {
         guard let url = archiveURL else { return }
-        archiveSize = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { UInt64($0) } ?? 0
-
-        let contentReader: ArchiveContentReader
-        let parsed: [ZipEntryInfo]
-        do {
-            contentReader = try ArchiveContentReader.open(url: url)
-            parsed = try contentReader.listEntries()
-        } catch {
-            ToastHUD.showAsync(title: "无法读取压缩包", content: error.localizedDescription, isSuccess: false)
-            return
-        }
-        self.reader = contentReader
-        resetPreviewSession()
-
-        roots = ZipEntryTree.build(from: parsed)
-
+        archiveLoadWorkItem?.cancel()
+        searchWorkItem?.cancel()
+        archiveLoadToken = UUID()
+        searchToken = UUID()
+        let token = archiveLoadToken
         let query = preserveSearch ? searchField.stringValue.trimmingCharacters(in: .whitespaces) : ""
-        if query.isEmpty {
-            visibleRoots = roots
-        } else {
-            visibleRoots = roots.compactMap { $0.filtered(matching: query) }
-        }
+        let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { UInt64($0) } ?? 0
 
-        let counts = ZipEntryTree.counts(in: roots)
-        let encrypted = roots.contains { $0.isEncrypted }
-        var summary = "\(counts.files) 个文件"
-        if counts.folders > 0 { summary += " · \(counts.folders) 个文件夹" }
-        if encrypted { summary += " · 🔒 已加密" }
-        if archiveSize > 0 {
-            summary += " · 压缩包 \(ByteCountFormatter.string(fromByteCount: Int64(archiveSize), countStyle: .file))"
-        }
-        summaryLabel.stringValue = summary
+        archiveSize = fileSize
+        archiveEntryCount = 0
+        loadedChildCounts.removeAll(keepingCapacity: true)
+        reader = nil
+        resetPreviewSession()
+        summaryLabel.stringValue = "正在读取压缩包…"
         titleLabel.stringValue = url.lastPathComponent
-        archiveSummary = summary
-
+        archiveSummary = ""
+        roots = []
+        visibleRoots = []
         outlineView.reloadData()
-        if query.isEmpty {
-            expandInitialLevel()
-        } else {
-            outlineView.expandItem(nil, expandChildren: true)
-        }
+        scheduleListDocumentLayout()
         resetPreview()
         updateToolbarState()
         updateStatusText()
+
+        let work = DispatchWorkItem {
+            do {
+                let contentReader = try ArchiveContentReader.open(url: url)
+                let parsed = try contentReader.listEntries()
+                let tree = ZipEntryTree.build(from: parsed)
+                let visible = query.isEmpty ? tree : tree.compactMap { $0.filtered(matching: query) }
+                let counts = ZipEntryTree.counts(in: tree)
+                let encrypted = tree.contains { $0.isEncrypted }
+                var summary = "\(counts.files) 个文件"
+                if counts.folders > 0 { summary += " · \(counts.folders) 个文件夹" }
+                if encrypted { summary += " · 🔒 已加密" }
+                if fileSize > 0 {
+                    summary += " · 压缩包 \(ByteCountFormatter.string(fromByteCount: Int64(fileSize), countStyle: .file))"
+                }
+
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.archiveLoadToken == token, self.archiveURL == url else { return }
+                    let currentQuery = self.searchField.stringValue.trimmingCharacters(in: .whitespaces)
+                    self.reader = contentReader
+                    self.archiveSize = fileSize
+                    self.archiveEntryCount = parsed.count
+                    self.roots = tree
+                    self.archiveSummary = summary
+                    self.summaryLabel.stringValue = summary
+                    self.loadedChildCounts.removeAll(keepingCapacity: true)
+                    self.visibleRoots = currentQuery == query ? visible : tree
+                    self.outlineView.reloadData()
+                    self.scheduleListDocumentLayout()
+                    if currentQuery != query {
+                        self.searchChanged(self.searchField)
+                    } else if query.isEmpty {
+                        self.expandInitialLevel()
+                    } else {
+                        self.expandSearchResults()
+                    }
+                    self.updateToolbarState()
+                    self.updateStatusText()
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.archiveLoadToken == token else { return }
+                    self.summaryLabel.stringValue = "无法读取压缩包"
+                    ToastHUD.showAsync(title: "无法读取压缩包", content: error.localizedDescription, isSuccess: false)
+                }
+            }
+        }
+        archiveLoadWorkItem = work
+        DispatchQueue.global(qos: .userInitiated).async(execute: work)
     }
 
     /// 初始只展开顶层目录,保持界面清爽;单根目录时再下探一层。
     private func expandInitialLevel() {
+        guard archiveEntryCount <= Self.automaticExpansionEntryLimit else { return }
         for node in visibleRoots where node.isDirectory && !node.children.isEmpty {
             outlineView.expandItem(node)
         }
@@ -527,6 +736,19 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
                 outlineView.expandItem(child)
             }
         }
+    }
+
+    /// 搜索只展开匹配路径,不对命中目录的全部后代递归展开。
+    private func expandSearchResults() {
+        func expand(_ node: ZipEntryNode) {
+            guard node.isDirectory, !node.children.isEmpty else { return }
+            outlineView.expandItem(node)
+            guard node.children.count <= Self.childPageSize else { return }
+            for child in node.children {
+                expand(child)
+            }
+        }
+        for node in visibleRoots { expand(node) }
     }
 
     /// 首次展示时把分隔条放在偏左位置,并保证列表宽度不低于最小可读宽度。
@@ -538,55 +760,188 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
         let desired = max(Self.minListWidth, width * Self.initialListRatio)
         splitView.setPosition(min(desired, width - Self.minPreviewWidth), ofDividerAt: 0)
         didSetInitialSplit = true
-        fitListColumns()
+        updateDocumentWidthConstraint()
+        scheduleListDocumentLayout()
     }
 
-    /// 让名称列吸收列表宽度的余量:固定列(大小/修改日期/种类)保持原宽,名称列伸缩,
-    /// 保证缩窗时四列都完整可见而非最右列被裁掉。
-    private func fitListColumns() {
-        guard let scrollView = listScrollView, let nameColumn else { return }
-        let available = scrollView.contentSize.width
-        guard available > 0 else { return }
-        let others = outlineView.tableColumns
-            .filter { $0 !== nameColumn }
-            .reduce(CGFloat(0)) { $0 + $1.width }
-        let spacing = outlineView.intercellSpacing.width * CGFloat(outlineView.tableColumns.count + 1)
-        let nameWidth = max(nameColumn.minWidth, available - others - spacing)
-        if abs(nameColumn.width - nameWidth) > 0.5 {
-            nameColumn.width = nameWidth
+    private func tableWidthRequiredByColumns() -> CGFloat {
+        let columnWidth = outlineView.tableColumns.reduce(CGFloat(0)) { $0 + $1.width }
+        // intercellSpacing.width 已置 0;.inset 样式仍会给列矩形附加首列左边距
+        // 与末列右缘约 16~22pt,预留 24pt 保证拖宽列后末列可完整滚入视野
+        // (多出的 2pt 只是滚动条略微提前出现)。
+        return columnWidth + 24
+    }
+
+    /// 保留用户设置的列宽,仅更新文档区的最小宽度以支持横向滚动。
+    private func updateDocumentWidthConstraint() {
+        guard listDocumentWidthConstraint != nil else { return }
+        listDocumentWidthConstraint.constant = tableWidthRequiredByColumns()
+    }
+
+    /// Auto Layout 文档视图不会根据 NSOutlineView 的可见行数自动增高。
+    /// 展开、搜索或分页后同步更新高度,让 NSScrollView 正确接管垂直滚动。
+    private func updateListDocumentHeight() {
+        guard listDocumentHeightConstraint != nil, listScrollView != nil else { return }
+        outlineView.layoutSubtreeIfNeeded()
+
+        let rowCount = outlineView.numberOfRows
+        let headerHeight = outlineView.headerView?.frame.height ?? 0
+        let minimumHeight = max(listScrollView.contentView.bounds.height, 1)
+        let rowsHeight: CGFloat
+        if rowCount > 0 {
+            rowsHeight = max(
+                outlineView.rect(ofRow: rowCount - 1).maxY + 4,
+                headerHeight + CGFloat(rowCount) * outlineView.rowHeight + 4
+            )
+        } else {
+            rowsHeight = headerHeight + 4
         }
+
+        let requiredHeight = max(minimumHeight, rowsHeight)
+        if abs(listDocumentHeightConstraint.constant - requiredHeight) > 0.5 {
+            listDocumentHeightConstraint.constant = requiredHeight
+            outlineView.needsLayout = true
+        }
+    }
+
+    private func scheduleListDocumentLayout() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.updateListDocumentHeight()
+        }
+    }
+
+    /// 限制自动恢复的历史窗口尺寸,避免旧状态把预览窗口铺满整个屏幕。
+    private func normalizeWindowFrame() {
+        guard let window else { return }
+        let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame
+        guard let visibleFrame else { return }
+
+        var frame = window.frame
+        let maximumWidth = min(Self.maxWindowSize.width, visibleFrame.width)
+        let maximumHeight = min(Self.maxWindowSize.height, visibleFrame.height)
+        frame.size.width = min(max(frame.size.width, Self.minWindowSize.width), maximumWidth)
+        frame.size.height = min(max(frame.size.height, Self.minWindowSize.height), maximumHeight)
+        frame.origin.x = min(
+            max(frame.origin.x, visibleFrame.minX),
+            visibleFrame.maxX - frame.size.width
+        )
+        frame.origin.y = min(
+            max(frame.origin.y, visibleFrame.minY),
+            visibleFrame.maxY - frame.size.height
+        )
+        window.setFrame(frame, display: false)
     }
 
     // MARK: - 动作
 
     @objc private func expandAllClicked() {
+        loadAllChildren(in: visibleRoots)
         outlineView.expandItem(nil, expandChildren: true)
+        scheduleListDocumentLayout()
     }
 
     @objc private func collapseAllClicked() {
         outlineView.collapseItem(nil, collapseChildren: true)
+        scheduleListDocumentLayout()
     }
 
     @objc private func searchChanged(_ sender: NSSearchField) {
         let query = sender.stringValue.trimmingCharacters(in: .whitespaces)
-        if query.isEmpty {
+        searchWorkItem?.cancel()
+        searchToken = UUID()
+        let token = searchToken
+        loadedChildCounts.removeAll(keepingCapacity: true)
+
+        guard !query.isEmpty else {
             visibleRoots = roots
-        } else {
-            visibleRoots = roots.compactMap { $0.filtered(matching: query) }
-        }
-        outlineView.reloadData()
-        if query.isEmpty {
+            outlineView.reloadData()
+            scheduleListDocumentLayout()
             expandInitialLevel()
-        } else {
-            outlineView.expandItem(nil, expandChildren: true)
+            resetPreview()
+            updateToolbarState()
+            updateStatusText()
+            return
         }
-        resetPreview()
+
+        let source = roots
+        let work = DispatchWorkItem { [weak self] in
+            let filtered = source.compactMap { $0.filtered(matching: query) }
+            DispatchQueue.main.async {
+                guard let self,
+                      self.searchToken == token,
+                      self.searchField.stringValue.trimmingCharacters(in: .whitespaces) == query
+                else { return }
+                self.visibleRoots = filtered
+                self.outlineView.reloadData()
+                self.scheduleListDocumentLayout()
+                self.expandSearchResults()
+                self.resetPreview()
+                self.updateToolbarState()
+                self.updateStatusText()
+            }
+        }
+        searchWorkItem = work
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.08, execute: work)
+    }
+
+    private func loadAllChildren(in nodes: [ZipEntryNode]) {
+        for node in nodes where node.isDirectory {
+            loadedChildCounts[node.path] = node.children.count
+            loadAllChildren(in: node.children)
+        }
+    }
+
+    private func loadMoreChildren(_ more: ArchiveMoreChildrenNode) {
+        let key = more.parent?.path ?? Self.rootChildrenKey
+        let total = more.parent?.children.count ?? visibleRoots.count
+        loadedChildCounts[key] = min(total, more.offset + Self.childPageSize)
+        if let parent = more.parent {
+            outlineView.reloadItem(parent, reloadChildren: true)
+        } else {
+            outlineView.reloadData()
+        }
+        scheduleListDocumentLayout()
         updateStatusText()
+    }
+
+    private func children(of parent: ZipEntryNode?) -> [ZipEntryNode] {
+        parent?.children ?? visibleRoots
+    }
+
+    private func loadedChildCount(of parent: ZipEntryNode?) -> Int {
+        let all = children(of: parent)
+        guard !all.isEmpty else { return 0 }
+        return min(all.count, loadedChildCounts[parent?.path ?? Self.rootChildrenKey] ?? Self.childPageSize)
+    }
+
+    private func childObject(at index: Int, of parent: ZipEntryNode?) -> Any {
+        let all = children(of: parent)
+        let loaded = loadedChildCount(of: parent)
+        if index < loaded {
+            return all[index]
+        }
+        return ArchiveMoreChildrenNode(
+            parent: parent,
+            offset: loaded,
+            remaining: all.count - loaded
+        )
+    }
+
+    private func numberOfChildren(of parent: ZipEntryNode?) -> Int {
+        let all = children(of: parent)
+        let loaded = loadedChildCount(of: parent)
+        return loaded + (loaded < all.count ? 1 : 0)
     }
 
     @objc private func rowDoubleClicked() {
         let row = outlineView.clickedRow
-        guard row >= 0, let node = outlineView.item(atRow: row) as? ZipEntryNode else { return }
+        guard row >= 0, let item = outlineView.item(atRow: row) else { return }
+        if let more = item as? ArchiveMoreChildrenNode {
+            loadMoreChildren(more)
+            return
+        }
+        guard let node = item as? ZipEntryNode else { return }
         if node.isDirectory {
             if outlineView.isItemExpanded(node) {
                 outlineView.collapseItem(node)
@@ -857,11 +1212,14 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
     private func updateToolbarState() {
         let hasSelection = !outlineView.selectedRowIndexes.isEmpty
         let editable = archiveFormat?.supportsEditing ?? false
+        let hasRows = !visibleRoots.isEmpty
         extractButton.isEnabled = hasSelection
         deleteButton.isEnabled = hasSelection && editable
         addButton.isEnabled = editable
         cleanButtonRef?.isEnabled = editable
         commentButton.isEnabled = editable
+        expandAllButton?.isEnabled = hasRows
+        collapseAllButton?.isEnabled = hasRows
     }
 
     private func updateStatusText() {
@@ -1152,10 +1510,15 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
     }
 
     func windowWillClose(_ notification: Notification) {
+        archiveLoadWorkItem?.cancel()
+        searchWorkItem?.cancel()
+        archiveLoadToken = UUID()
+        searchToken = UUID()
         resetPreviewSession()
         reader = nil
         roots = []
         visibleRoots = []
+        loadedChildCounts.removeAll()
         archiveURL = nil
         Self.activeControllers.removeAll { $0 === self }
     }
@@ -1163,7 +1526,13 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
     // MARK: - NSSplitViewDelegate
 
     func splitViewDidResizeSubviews(_ notification: Notification) {
-        fitListColumns()
+        updateDocumentWidthConstraint()
+        scheduleListDocumentLayout()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        updateActionButtonMode()
+        scheduleListDocumentLayout()
     }
 
     func splitView(
@@ -1187,18 +1556,20 @@ final class ArchivePreviewWindowController: NSWindowController, NSWindowDelegate
 
 extension ArchivePreviewWindowController: NSOutlineViewDataSource, NSOutlineViewDelegate {
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
-        guard let node = item as? ZipEntryNode else { return visibleRoots.count }
-        return node.children.count
+        numberOfChildren(of: item as? ZipEntryNode)
     }
 
     func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
-        guard let node = item as? ZipEntryNode else { return visibleRoots[index] }
-        return node.children[index]
+        childObject(at: index, of: item as? ZipEntryNode)
     }
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
         guard let node = item as? ZipEntryNode else { return false }
         return node.isDirectory && !node.children.isEmpty
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {
+        !(item is ArchiveMoreChildrenNode)
     }
 
     func outlineViewSelectionDidChange(_ notification: Notification) {
@@ -1207,7 +1578,44 @@ extension ArchivePreviewWindowController: NSOutlineViewDataSource, NSOutlineView
         updateStatusText()
     }
 
+    func outlineViewItemDidExpand(_ notification: Notification) {
+        scheduleListDocumentLayout()
+    }
+
+    func outlineViewItemDidCollapse(_ notification: Notification) {
+        scheduleListDocumentLayout()
+    }
+
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+        if let more = item as? ArchiveMoreChildrenNode, let column = tableColumn {
+            switch column.identifier.rawValue {
+            case "name":
+                let cell = reusableCell(identifier: "name", hasIcon: true)
+                cell.textField?.stringValue = "显示更多（还剩 \(more.remaining) 项）"
+                cell.textField?.textColor = .controlAccentColor
+                cell.imageView?.image = NSImage(
+                    systemSymbolName: "ellipsis.circle",
+                    accessibilityDescription: nil
+                )
+                cell.imageView?.contentTintColor = .controlAccentColor
+                return cell
+            case "size":
+                let cell = reusableCell(identifier: "size", hasIcon: false)
+                cell.textField?.stringValue = ""
+                return cell
+            case "date":
+                let cell = reusableCell(identifier: "date", hasIcon: false)
+                cell.textField?.stringValue = ""
+                return cell
+            case "kind":
+                let cell = reusableCell(identifier: "kind", hasIcon: false)
+                cell.textField?.stringValue = "继续加载"
+                cell.textField?.textColor = .controlAccentColor
+                return cell
+            default:
+                return nil
+            }
+        }
         guard let node = item as? ZipEntryNode, let column = tableColumn else { return nil }
         switch column.identifier.rawValue {
         case "name":
@@ -1254,6 +1662,14 @@ extension ArchivePreviewWindowController: NSOutlineViewDataSource, NSOutlineView
         }
     }
 
+    func outlineViewColumnDidResize(_ notification: Notification) {
+        updateDocumentWidthConstraint()
+    }
+
+    func tableViewColumnDidResize(_ notification: Notification) {
+        updateDocumentWidthConstraint()
+    }
+
     private func reusableCell(identifier: String, hasIcon: Bool) -> NSTableCellView {
         let id = NSUserInterfaceItemIdentifier(identifier)
         if let reused = outlineView.makeView(withIdentifier: id, owner: nil) as? NSTableCellView {
@@ -1285,9 +1701,11 @@ extension ArchivePreviewWindowController: NSOutlineViewDataSource, NSOutlineView
                 textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
             ])
         } else {
+            // 左右各留 8pt:右对齐的大小/日期与表头 trailingInset 对齐,
+            // 左对齐的种类与表头 leadingInset 对齐。
             NSLayoutConstraint.activate([
-                textField.leadingAnchor.constraint(equalTo: cell.leadingAnchor),
-                textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+                textField.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+                textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8),
                 textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
             ])
         }

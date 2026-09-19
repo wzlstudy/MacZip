@@ -7,6 +7,7 @@ public final class ExternalArchiver {
     public static let shared = ExternalArchiver()
 
     private let fm = FileManager.default
+    private let maxCapturedOutputBytes = 64 * 1024
 
     private init() {}
 
@@ -224,9 +225,21 @@ public final class ExternalArchiver {
             try? fm.removeItem(at: outURL)
             throw ArchiverError.executionFailed(message: "无法启动 /usr/bin/gzip: \(error.localizedDescription)")
         }
-        // stdout 直写文件无管道缓冲风险;stderr 仅承载少量错误信息,同步排空不会死锁。
-        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+        // stdout 直写文件;stderr 在独立线程持续排空,避免错误输出过多时阻塞 gzip。
+        let stderrGroup = DispatchGroup()
+        let stderrLock = NSLock()
+        var stderrData = Data()
+        stderrGroup.enter()
+        DispatchQueue.global(qos: .utility).async { [self] in
+            let captured = readCappedOutput(from: stderrPipe.fileHandleForReading)
+            stderrLock.lock()
+            stderrData = captured
+            stderrLock.unlock()
+            stderrGroup.leave()
+        }
         process.waitUntilExit()
+        stderrGroup.wait()
 
         guard process.terminationStatus == 0 else {
             // 失败清理半成品;输出文件此前已存在时不删 (避免误删用户文件)。
@@ -266,13 +279,55 @@ public final class ExternalArchiver {
             return RunResult(exitCode: -1, output: "无法启动 \(launchPath): \(error.localizedDescription)", stdoutData: Data())
         }
 
-        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        // 7z 默认会为每个文件输出一行。两个管道并行排空并各自限长,
+        // 只保留诊断所需的尾部,避免多文件归档让内存随文件数增长。
+        let outputGroup = DispatchGroup()
+        let outputLock = NSLock()
+        var stdoutData = Data()
+        var stderrData = Data()
+        outputGroup.enter()
+        DispatchQueue.global(qos: .utility).async { [self] in
+            let captured = readCappedOutput(from: stdoutPipe.fileHandleForReading)
+            outputLock.lock()
+            stdoutData = captured
+            outputLock.unlock()
+            outputGroup.leave()
+        }
+        outputGroup.enter()
+        DispatchQueue.global(qos: .utility).async { [self] in
+            let captured = readCappedOutput(from: stderrPipe.fileHandleForReading)
+            outputLock.lock()
+            stderrData = captured
+            outputLock.unlock()
+            outputGroup.leave()
+        }
         process.waitUntilExit()
+        outputGroup.wait()
 
         var output = String(data: stdoutData, encoding: .utf8) ?? ""
         output += "\n" + (String(data: stderrData, encoding: .utf8) ?? "")
         return RunResult(exitCode: process.terminationStatus, output: output, stdoutData: stdoutData)
+    }
+
+    /// 从管道持续读取,只保留最后一段输出用于错误诊断。
+    private func readCappedOutput(from handle: FileHandle) -> Data {
+        var result = Data()
+        while true {
+            let chunk = handle.readData(ofLength: 64 * 1024)
+            if chunk.isEmpty { break }
+
+            if chunk.count >= maxCapturedOutputBytes {
+                result = Data(chunk.suffix(maxCapturedOutputBytes))
+                continue
+            }
+
+            let keepExisting = maxCapturedOutputBytes - chunk.count
+            if result.count > keepExisting {
+                result = Data(result.suffix(keepExisting))
+            }
+            result.append(chunk)
+        }
+        return result
     }
 
     private func lastMeaningfulLine(_ text: String) -> String {

@@ -101,20 +101,26 @@ public final class ArchiveService {
         guard let first = inputs.first else {
             return fm.temporaryDirectory.appendingPathComponent("Archive.\(format.fileExtension)")
         }
-        var name: String
+        let name = defaultArchiveBaseName(for: inputs)
+        let parent = first.deletingLastPathComponent()
+        return parent.appendingPathComponent("\(name).\(format.fileExtension)")
+    }
+
+    /// 计算默认压缩包主体名。
+    ///
+    /// 目录名本身可能包含点号 (例如 0.0.203),不能按文件扩展名截断;
+    /// 只有普通文件才去掉最后一级扩展名。
+    public static func defaultArchiveBaseName(for inputs: [URL]) -> String {
+        guard let first = inputs.first else { return "Archive" }
+        let name: String
         if inputs.count == 1 {
-            name = first.deletingPathExtension().lastPathComponent
-            if fm.fileExists(atPath: first.path) && Self.isDirectory(first) {
-                // 目录压缩:去掉原扩展名即可,如 Photos.dmg → Photos.zip。
-                name = first.lastPathComponent
-                name = (name as NSString).deletingPathExtension
-            }
+            name = isDirectory(first)
+                ? first.lastPathComponent
+                : first.deletingPathExtension().lastPathComponent
         } else {
             name = first.deletingLastPathComponent().lastPathComponent
         }
-        if name.isEmpty { name = "Archive" }
-        let parent = first.deletingLastPathComponent()
-        return parent.appendingPathComponent("\(name).\(format.fileExtension)")
+        return name.isEmpty ? "Archive" : name
     }
 
     static func isDirectory(_ url: URL) -> Bool {
@@ -150,11 +156,21 @@ public final class ArchiveService {
         }
 
         let candidates = preferPasswordBook ? PasswordBook.shared.passwords : []
+        let workingFormat = ArchiveFormat.detect(url: workingArchive)
+        var zipReader: ZipReader?
+        switch workingFormat {
+        case .zip, .jar, .splitVolume, nil:
+            zipReader = ZipReader(archiveURL: workingArchive)
+        default:
+            break
+        }
 
         func runExtract(to destination: URL) throws {
-            switch ArchiveFormat.detect(url: workingArchive) {
+            switch workingFormat {
             case .zip, .jar, .splitVolume, nil:
-                let reader = ZipReader(archiveURL: workingArchive)
+                guard let reader = zipReader else {
+                    throw ZipError.unsupportedArchiveFormat
+                }
                 try reader.extractAll(
                     options: .init(
                         destination: destination,
@@ -197,9 +213,9 @@ public final class ArchiveService {
         } else {
             let parent = archive.deletingLastPathComponent()
             var needsSubfolder = false
-            switch ArchiveFormat.detect(url: workingArchive) {
+            switch workingFormat {
             case .zip, .jar, .splitVolume, nil:
-                if let entries = try? ZipReader(archiveURL: workingArchive).listEntries() {
+                if let reader = zipReader, let entries = try? reader.listEntries() {
                     let top = Set(entries.map { topLevelComponent($0.name) })
                     needsSubfolder = top.count > 1
                 }

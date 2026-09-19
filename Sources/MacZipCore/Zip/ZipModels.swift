@@ -139,25 +139,34 @@ public struct ZipBlockMap: Equatable {
     }
 
     /// 从 extra 字节区间解析;ID / 版本 / 长度不符返回 nil (调用方回退串行路径)。
-    /// 入口复制归零索引 (Data 切片保留原 startIndex,直接下标会越界)。
+    /// 只有传入的 Data 不是零起始索引时才归一化,避免中央目录解析中的整段复制。
     static func parse(from data: Data, range: Range<Int>) -> ZipBlockMap? {
-        let data = Data(data)
-        var cursor = range.lowerBound
-        let end = range.upperBound
+        let source: Data
+        let normalizedRange: Range<Int>
+        if data.startIndex == 0 {
+            source = data
+            normalizedRange = range
+        } else {
+            source = Data(data)
+            normalizedRange = (range.lowerBound - data.startIndex)..<(range.upperBound - data.startIndex)
+        }
+
+        var cursor = normalizedRange.lowerBound
+        let end = normalizedRange.upperBound
         while cursor + 4 <= end {
-            let id = data.readLE16(at: cursor)
-            let size = Int(data.readLE16(at: cursor + 2))
+            let id = source.readLE16(at: cursor)
+            let size = Int(source.readLE16(at: cursor + 2))
             let next = cursor + 4 + size
             guard next <= end else { break }
-            if id == extraFieldID, size >= 10, data[cursor + 4] == version {
-                let blockSize = UInt64(data.readLE32(at: cursor + 6))
-                let count = Int(data.readLE32(at: cursor + 10))
+            if id == extraFieldID, size >= 10, source[cursor + 4] == version {
+                let blockSize = UInt64(source.readLE32(at: cursor + 6))
+                let count = Int(source.readLE32(at: cursor + 10))
                 guard count > 0, size >= 10 + count * 4 else { break }
                 var sizes: [UInt64] = []
                 sizes.reserveCapacity(count)
                 var field = cursor + 14
                 for _ in 0..<count {
-                    sizes.append(UInt64(data.readLE32(at: field)))
+                    sizes.append(UInt64(source.readLE32(at: field)))
                     field += 4
                 }
                 return ZipBlockMap(blockSize: blockSize, segmentSizes: sizes)

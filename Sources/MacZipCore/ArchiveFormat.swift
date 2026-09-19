@@ -70,6 +70,64 @@ public enum ArchiveFormat: String, CaseIterable {
         return nil
     }
 
+    /// 校验路径是否为实际存在且具备对应文件头的压缩包。
+    ///
+    /// `detect(url:)` 主要依据文件名推断格式,适合路由和预览入口;
+    /// Finder 右键菜单则需要进一步排除“普通文件改了压缩包后缀”和“同名目录”。
+    public static func isArchiveFile(at url: URL) -> Bool {
+        guard let format = detect(url: url) else { return false }
+
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue,
+              let handle = try? FileHandle(forReadingFrom: url) else {
+            return false
+        }
+        defer { try? handle.close() }
+
+        let header = handle.readData(ofLength: 512)
+        switch format {
+        case .zip, .jar, .splitVolume:
+            return hasAnyPrefix(
+                in: header,
+                signatures: [
+                    [0x50, 0x4B, 0x03, 0x04], // local file header
+                    [0x50, 0x4B, 0x05, 0x06], // empty archive
+                    [0x50, 0x4B, 0x06, 0x06], // ZIP64 EOCD
+                    [0x50, 0x4B, 0x07, 0x08]  // spanning/data descriptor
+                ]
+            )
+        case .gzip, .tarGz:
+            return hasPrefix([0x1F, 0x8B], in: header)
+        case .tarBz2:
+            return hasPrefix([0x42, 0x5A, 0x68], in: header) // BZh
+        case .tarXz:
+            return hasPrefix([0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00], in: header)
+        case .sevenZip:
+            return hasPrefix([0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C], in: header)
+        case .rar:
+            return hasAnyPrefix(
+                in: header,
+                signatures: [
+                    [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00], // RAR4
+                    [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00] // RAR5
+                ]
+            )
+        case .tar:
+            guard header.count >= 262 else { return false }
+            return header.subdata(in: 257..<262) == Data("ustar".utf8)
+        }
+    }
+
+    private static func hasPrefix(_ signature: [UInt8], in data: Data) -> Bool {
+        guard data.count >= signature.count else { return false }
+        return Array(data.prefix(signature.count)) == signature
+    }
+
+    private static func hasAnyPrefix(in data: Data, signatures: [[UInt8]]) -> Bool {
+        signatures.contains { hasPrefix($0, in: data) }
+    }
+
     /// 该格式是否由 MacZip 内建引擎直接处理 (不经外部工具)。
     public var isBuiltIn: Bool {
         switch self {

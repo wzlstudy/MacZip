@@ -223,18 +223,21 @@ class FinderSync: FIFinderSync {
             ))
         }
 
+        var primaryExtractActionId: String?
         if settings.showExtractMenu,
-           let extractHere = available.first(where: { $0.actionId == "maczip.action.extract.here" }),
-           let subfolder = available.first(where: { $0.actionId == "maczip.action.extract.subfolder" }) {
+           let extractHere = available.first(where: { $0.actionId == "maczip.action.extract.here" }) {
             if !isContainer, let single = targetURLs.first, targetURLs.count == 1,
+               let subfolder = available.first(where: { $0.actionId == "maczip.action.extract.subfolder" }),
                subfolder.isAvailable(for: targetURLs, isContainer: isContainer) {
                 let folderName = (single.lastPathComponent as NSString).deletingPathExtension
                 let title = subfolder.titleTemplate.replacingOccurrences(of: "%@", with: "\(folderName)/")
                 menu.addItem(makeItem(action: subfolder, title: title, invocationKind: invocationKind))
+                primaryExtractActionId = subfolder.actionId
             } else {
                 menu.addItem(makeItem(
                     action: extractHere, title: extractHere.titleTemplate, invocationKind: invocationKind
                 ))
+                primaryExtractActionId = extractHere.actionId
             }
         }
 
@@ -248,6 +251,7 @@ class FinderSync: FIFinderSync {
         let extractExtras = available.filter {
             ["maczip.action.extract.here", "maczip.action.extract.subfolder",
              "maczip.action.extract.to", "maczip.action.test"].contains($0.actionId)
+                && $0.actionId != primaryExtractActionId
         }
 
         if settings.showAdvancedMenu && (!compressExtras.isEmpty || !extractExtras.isEmpty) {
@@ -284,8 +288,11 @@ class FinderSync: FIFinderSync {
             }
         }
 
-        log("菜单渲染完毕,主菜单项: \(menu.items.count)")
-        return menu.items.isEmpty ? nil : menu
+        guard !menu.items.isEmpty else { return nil }
+
+        // 保持 Finder 右键菜单中的直接操作项,不额外增加 MacZip 子菜单层级。
+        log("菜单渲染完毕,MacZip 菜单项: \(menu.items.count)")
+        return menu
     }
 
     private func makeItem(
@@ -307,17 +314,7 @@ class FinderSync: FIFinderSync {
 
     /// 依据选中目标推断默认压缩产物名 (FastZip 行为)。
     static func defaultArchiveName(for targets: [URL], format: String) -> String {
-        guard let first = targets.first else { return "Archive.\(format)" }
-        var name: String
-        if targets.count == 1 {
-            name = first.lastPathComponent
-            // 目录或文件:去掉自身扩展名再拼目标格式 (Photos.dmg → Photos.zip)。
-            name = (name as NSString).deletingPathExtension
-        } else {
-            name = first.deletingLastPathComponent().lastPathComponent
-        }
-        if name.isEmpty { name = "Archive" }
-        return "\(name).\(format)"
+        return "\(ArchiveService.defaultArchiveBaseName(for: targets)).\(format)"
     }
 
     private func log(_ message: String) {

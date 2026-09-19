@@ -6,3 +6,6 @@ build/
 
 # IDE 本地配置
 .idea/
+
+# IDE 插件本地产物
+.fastRequest/

@@ -140,7 +140,7 @@ public enum DefaultActionRegistry {
         }
         /// 所有格式 (含分卷首段) 的统一判定入口。
         static func isArchive(_ url: URL) -> Bool {
-            ArchiveFormat.detect(url: url) != nil
+            ArchiveFormat.isArchiveFile(at: url)
         }
     }
 

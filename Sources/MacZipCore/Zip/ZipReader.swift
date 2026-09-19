@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// MacZip 自研多线程 ZIP 读取器。
 ///
@@ -7,6 +8,15 @@ import Foundation
 /// - 解压、测试完整性、列目录共用同一套解析与校验管线;
 /// - 并发条目各自持有独立 FileHandle,规避 seek 竞态。
 public final class ZipReader {
+    /// 多文件解压的默认并发度。
+    ///
+    /// 每个文件至少持有输入/输出各一个 1 MiB 缓冲区。限制默认并发度既
+    /// 避免小文件场景产生过多文件系统操作,也给 SSD/网络盘留出 I/O 队列空间。
+    public static let defaultMaxConcurrency = max(
+        1,
+        min(ProcessInfo.processInfo.activeProcessorCount, 4)
+    )
+
     /// 解析出的中央目录。
     public struct CentralDirectory {
         public var entries: [ZipEntryInfo]
@@ -44,7 +54,7 @@ public final class ZipReader {
             passwordPrompt: ((String, Int) -> String?)? = nil,
             conflictPolicy: ConflictPolicy = .rename,
             errorPolicy: ErrorPolicy = .skipCorrupt,
-            maxConcurrency: Int = ProcessInfo.processInfo.activeProcessorCount
+            maxConcurrency: Int = ZipReader.defaultMaxConcurrency
         ) {
             self.destination = destination
             self.password = password
@@ -73,8 +83,10 @@ public final class ZipReader {
 
     private let archiveURL: URL
     private let fm = FileManager.default
-    /// entry index → 中央目录中的 local header offset。readCentralDirectory 一次性写入,之后只读。
-    private var localOffsets: [Int: UInt64] = [:]
+    /// entry index → 中央目录中的 local header offset。解析后只读。
+    /// 数组比 Dictionary 少一层哈希表和节点分配,对几十万条目更省内存。
+    private var localOffsets: [UInt64] = []
+    private var cachedCentralDirectory: CentralDirectory?
 
     public init(archiveURL: URL) {
         self.archiveURL = archiveURL
@@ -84,6 +96,10 @@ public final class ZipReader {
 
     /// 解析中央目录 (只读文件列表,供 QuickLook 预览与解压共用)。
     public func readCentralDirectory() throws -> CentralDirectory {
+        if let cachedCentralDirectory {
+            return cachedCentralDirectory
+        }
+
         let handle = try FileHandle(forReadingFrom: archiveURL)
         defer { try? handle.close() }
 
@@ -123,13 +139,29 @@ public final class ZipReader {
             }
         }
 
-        try handle.seek(toOffset: cdOffset)
-        let cdData = handle.readData(ofLength: Int(cdSize))
+        guard cdSize <= UInt64(Int.max) else {
+            throw ZipError.corruptEntry(reason: "中央目录超过当前系统可寻址大小")
+        }
+        let cdData: Data
+        if cdSize == 0 {
+            cdData = Data()
+        } else if let mapped = mapCentralDirectory(
+            fileDescriptor: handle.fileDescriptor,
+            offset: cdOffset,
+            length: Int(cdSize)
+        ) {
+            // Data 持有 mmap 的自定义释放闭包,解析期间不会提前解除映射。
+            cdData = mapped
+        } else {
+            try handle.seek(toOffset: cdOffset)
+            cdData = handle.readData(ofLength: Int(cdSize))
+        }
         guard cdData.count == Int(cdSize) else { throw ZipError.truncatedEntry }
 
         var entries: [ZipEntryInfo] = []
         entries.reserveCapacity(min(entriesTotal, 1_000_000))
-        var offsets: [Int: UInt64] = [:]
+        var offsets: [UInt64] = []
+        offsets.reserveCapacity(min(entriesTotal, 1_000_000))
         var cursor = 0
         while cursor + 46 <= cdData.count {
             guard cdData.readLE32(at: cursor) == 0x02014b50 else { break }
@@ -175,7 +207,7 @@ public final class ZipReader {
             // 自研分块并行布局 (0x6D7A);外部包无此字段,parse 返回 nil。
             let blockMap = ZipBlockMap.parse(from: cdData, range: nameEnd..<extraEnd)
 
-            offsets[entries.count] = localOffset
+            offsets.append(localOffset)
             entries.append(ZipEntryInfo(
                 name: rawName,
                 isDirectory: isDirectory,
@@ -192,7 +224,51 @@ public final class ZipReader {
         }
 
         localOffsets = offsets
-        return CentralDirectory(entries: entries, comment: comment)
+        let directory = CentralDirectory(entries: entries, comment: comment)
+        cachedCentralDirectory = directory
+        return directory
+    }
+
+    /// 将中央目录映射为只读 Data,避免先分配一份与中央目录等大的堆缓冲。
+    /// 映射失败时由调用方回退到 FileHandle 分块读取路径。
+    private func mapCentralDirectory(
+        fileDescriptor: Int32,
+        offset: UInt64,
+        length: Int
+    ) -> Data? {
+        guard length > 0 else { return Data() }
+        let pageSize = Int(getpagesize())
+        guard pageSize > 0 else { return nil }
+
+        let alignedOffset = offset - (offset % UInt64(pageSize))
+        let delta = Int(offset - alignedOffset)
+        guard length <= Int.max - delta else { return nil }
+        let mappedLength = length + delta
+        guard alignedOffset <= UInt64(Int64.max) else { return nil }
+
+        let mapped = mmap(
+            nil,
+            mappedLength,
+            PROT_READ,
+            MAP_PRIVATE,
+            fileDescriptor,
+            off_t(alignedOffset)
+        )
+        guard mapped != MAP_FAILED, let base = mapped else { return nil }
+
+        let visible = base.advanced(by: delta)
+        return Data(
+            bytesNoCopy: visible,
+            count: length,
+            deallocator: .custom { _, _ in
+                _ = munmap(base, mappedLength)
+            }
+        )
+    }
+
+    private func localOffset(for entry: ZipEntryInfo) -> UInt64? {
+        guard entry.index >= 0, entry.index < localOffsets.count else { return nil }
+        return localOffsets[entry.index]
     }
 
     private func findEOCDOffset(in tail: Data) -> Int? {
@@ -263,7 +339,7 @@ public final class ZipReader {
         guard !entry.isDirectory else { return 0 }
 
         // 极端情况:调用方未曾列目录 (localOffsets 为空) 时补解析一次。
-        if localOffsets[entry.index] == nil {
+        if localOffset(for: entry) == nil {
             _ = try readCentralDirectory()
         }
 
@@ -313,9 +389,17 @@ public final class ZipReader {
         guard !targets.isEmpty else { return 0 }
 
         try fm.createDirectory(at: options.destination, withIntermediateDirectories: true)
+        let plan = try buildExtractionPlan(for: targets, options: options)
+        try prepareDirectories(
+            destinations: plan.destinations,
+            entries: targets,
+            destination: options.destination
+        )
 
-        let totalBytes = targets.reduce(UInt64(0)) { $0 + $1.uncompressedSize }
-        reporter.begin(totalBytes: totalBytes, title: "正在解压 \(targets.count) 个项目")
+        reporter.begin(
+            totalBytes: plan.totalBytes,
+            title: "正在解压 \(plan.fileCount) 个文件"
+        )
 
         // 预解析密码策略。
         let resolver = PasswordResolver(
@@ -327,14 +411,25 @@ public final class ZipReader {
         var firstError: Error?
         var skippedEntries: [String] = []
         let lock = NSLock()
-        let concurrency = max(1, min(options.maxConcurrency, targets.count))
+        // 自研分块条目内部会按 CPU 核数并行 inflate。此时只允许一个条目
+        // 进入解压管线,避免文件级与块级并发相乘,造成线程/缓冲区和磁盘争用。
+        let concurrency = plan.hasParallelBlock
+            ? 1
+            : max(1, min(options.maxConcurrency, max(1, plan.fileCount)))
         let semaphore = DispatchSemaphore(value: concurrency)
         let group = DispatchGroup()
 
-        for entry in targets {
-            if (firstError != nil) || reporter.isCancelled { break }
+        for (index, entry) in targets.enumerated() {
+            let outputPath = plan.destinations[index]
+            lock.lock()
+            let shouldStop = firstError != nil
+            lock.unlock()
+            if shouldStop || reporter.isCancelled { break }
             semaphore.wait()
-            if (firstError != nil) || reporter.isCancelled {
+            lock.lock()
+            let shouldStopAfterWait = firstError != nil
+            lock.unlock()
+            if shouldStopAfterWait || reporter.isCancelled {
                 semaphore.signal()
                 break
             }
@@ -348,7 +443,7 @@ public final class ZipReader {
                 do {
                     try self.extractEntry(
                         entry,
-                        options: options,
+                        destination: outputPath,
                         resolver: resolver,
                         reporter: reporter
                     )
@@ -374,7 +469,7 @@ public final class ZipReader {
             throw ZipError.partialFailure(skipped: skippedEntries.sorted())
         }
         reporter.finish(message: "解压完成", subtitle: archiveURL.lastPathComponent)
-        return targets.filter { !$0.isDirectory }.count
+        return plan.fileCount
     }
 
     /// 取消类错误:任何策略下都中止。
@@ -412,18 +507,47 @@ public final class ZipReader {
 
         var firstError: Error?
         let lock = NSLock()
+        let hasParallelBlock = targets.contains {
+            ($0.blockMap?.segmentSizes.count ?? 0) > 1
+        }
+        let concurrency = hasParallelBlock
+            ? 1
+            : max(1, min(options.maxConcurrency, targets.count))
+        let semaphore = DispatchSemaphore(value: concurrency)
+        let group = DispatchGroup()
 
-        DispatchQueue.concurrentPerform(iterations: targets.count) { index in
-            if firstError != nil || reporter.isCancelled { return }
-            let entry = targets[index]
-            do {
-                try inflateEntryForTest(entry, resolver: resolver, reporter: reporter)
-            } catch {
-                lock.lock()
-                if firstError == nil { firstError = error }
-                lock.unlock()
+        for entry in targets {
+            lock.lock()
+            let shouldStop = firstError != nil
+            lock.unlock()
+            if shouldStop || reporter.isCancelled { break }
+
+            semaphore.wait()
+            lock.lock()
+            let shouldStopAfterWait = firstError != nil
+            lock.unlock()
+            if shouldStopAfterWait || reporter.isCancelled {
+                semaphore.signal()
+                break
+            }
+
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                defer {
+                    group.leave()
+                    semaphore.signal()
+                }
+                guard let self else { return }
+                do {
+                    try self.inflateEntryForTest(entry, resolver: resolver, reporter: reporter)
+                } catch {
+                    lock.lock()
+                    if firstError == nil { firstError = error }
+                    lock.unlock()
+                }
             }
         }
+        group.wait()
         if reporter.isCancelled && firstError == nil { throw ZipError.cancelled }
         if let error = firstError { throw error }
         reporter.finish(message: "压缩包完好", subtitle: archiveURL.lastPathComponent)
@@ -431,67 +555,146 @@ public final class ZipReader {
 
     // MARK: - 单条目处理
 
-    /// 目标路径决策:防穿越 + 冲突策略。返回 nil 表示按 skip 跳过。
-    private func resolveDestinationPath(
-        for entryName: String,
-        options: ExtractOptions
-    ) throws -> URL? {
+    private struct ExtractionPlan {
+        /// 与输入 entries 按索引对应。nil 表示该条目被 skip 策略跳过。
+        var destinations: [String?]
+        var fileCount: Int
+        var totalBytes: UInt64
+        var hasParallelBlock: Bool
+    }
+
+    /// 规范化 ZIP 相对路径。保持现有兼容行为:剥掉根符号、盘符和 .. 组件,
+    /// 空路径仍视为非法条目。
+    private func safePathComponents(for entryName: String) throws -> [String] {
         // 防路径穿越:剥掉盘符/根符号与 .. 组件。
-        var components = entryName.split(separator: "/", omittingEmptySubsequences: true)
+        let components = entryName.split(separator: "/", omittingEmptySubsequences: true)
             .map { String($0) }
             .filter { $0 != ".." && $0 != "." && !$0.hasSuffix(":") }
         guard !components.isEmpty else {
             throw ZipError.pathTraversalDetected(entryName: entryName)
         }
-        var fileName = components[components.count - 1]
-        let baseDir = components.dropLast().reduce(options.destination) { $0.appendingPathComponent($1) }
-        let target = baseDir.appendingPathComponent(fileName)
+        return components
+    }
 
-        guard fm.fileExists(atPath: target.path) else {
-            return components.reduce(options.destination) { $0.appendingPathComponent($1) }
+    private func url(
+        for components: [String],
+        destination: URL
+    ) -> URL {
+        components.reduce(destination) { $0.appendingPathComponent($1) }
+    }
+
+    private func pathKey(_ url: URL) -> String {
+        url.standardizedFileURL.path
+    }
+
+    /// 串行生成唯一落盘路径,将冲突决策从 worker 中移出。
+    private func buildExtractionPlan(
+        for entries: [ZipEntryInfo],
+        options: ExtractOptions
+    ) throws -> ExtractionPlan {
+        // 只保留路径字符串,不复制 ZipEntryInfo 或长期持有 URL 对象。
+        var destinations = Array<String?>(repeating: nil, count: entries.count)
+        var occupied = Set<String>()
+
+        // 先登记目录,防止归档内同名文件与目录在并发时互相覆盖。
+        for (index, entry) in entries.enumerated() where entry.isDirectory {
+            let components = try safePathComponents(for: entry.name)
+            let directoryURL = url(for: components, destination: options.destination)
+            destinations[index] = directoryURL.path
+            occupied.insert(pathKey(directoryURL))
         }
-        switch options.conflictPolicy {
-        case .overwrite:
-            return components.reduce(options.destination) { $0.appendingPathComponent($1) }
-        case .skip:
-            return nil
-        case .rename:
-            var counter = 1
-            let stem = (fileName as NSString).deletingPathExtension
-            let ext = (fileName as NSString).pathExtension
-            while fm.fileExists(atPath: baseDir.appendingPathComponent(fileName).path) {
-                counter += 1
-                fileName = ext.isEmpty ? "\(stem) \(counter)" : "\(stem) \(counter).\(ext)"
+
+        var fileCount = 0
+        var totalBytes: UInt64 = 0
+        var hasParallelBlock = false
+        for (index, entry) in entries.enumerated() where !entry.isDirectory {
+            let components = try safePathComponents(for: entry.name)
+            let baseComponents = Array(components.dropLast())
+            let baseDir = url(for: baseComponents, destination: options.destination)
+            let originalName = components[components.count - 1]
+            var fileName = originalName
+            var candidate: URL? = baseDir.appendingPathComponent(fileName)
+
+            switch options.conflictPolicy {
+            case .overwrite:
+                break
+            case .skip:
+                if let current = candidate,
+                   fm.fileExists(atPath: current.path) || occupied.contains(pathKey(current)) {
+                    candidate = nil
+                }
+            case .rename:
+                let stem = (originalName as NSString).deletingPathExtension
+                let ext = (originalName as NSString).pathExtension
+                var counter = 1
+                while let current = candidate,
+                      fm.fileExists(atPath: current.path) || occupied.contains(pathKey(current)) {
+                    counter += 1
+                    fileName = ext.isEmpty
+                        ? "\(stem) \(counter)"
+                        : "\(stem) \(counter).\(ext)"
+                    candidate = baseDir.appendingPathComponent(fileName)
+                }
             }
-            components[components.count - 1] = fileName
-            return components.reduce(options.destination) { $0.appendingPathComponent($1) }
+
+            if let candidate {
+                destinations[index] = candidate.path
+                occupied.insert(pathKey(candidate))
+                fileCount += 1
+                totalBytes += entry.uncompressedSize
+                hasParallelBlock = hasParallelBlock
+                    || (entry.blockMap?.segmentSizes.count ?? 0) > 1
+            }
+        }
+
+        return ExtractionPlan(
+            destinations: destinations,
+            fileCount: fileCount,
+            totalBytes: totalBytes,
+            hasParallelBlock: hasParallelBlock
+        )
+    }
+
+    /// 去重后一次性创建目录。worker 不再为每个文件重复 stat/createDirectory。
+    private func prepareDirectories(
+        destinations: [String?],
+        entries: [ZipEntryInfo],
+        destination: URL
+    ) throws {
+        var directories: Set<String> = [pathKey(destination)]
+        for (index, outputPath) in destinations.enumerated() {
+            guard let outputPath else { continue }
+            let outputURL = URL(fileURLWithPath: outputPath)
+            let directoryURL = entries[index].isDirectory
+                ? outputURL
+                : outputURL.deletingLastPathComponent()
+            directories.insert(pathKey(directoryURL))
+        }
+
+        let ordered = directories.sorted {
+            $0.count < $1.count
+        }
+        for directoryPath in ordered {
+            try fm.createDirectory(
+                at: URL(fileURLWithPath: directoryPath),
+                withIntermediateDirectories: true
+            )
         }
     }
 
     private func extractEntry(
         _ entry: ZipEntryInfo,
-        options: ExtractOptions,
+        destination outputPath: String?,
         resolver: PasswordResolver,
         reporter: ArchiveProgressReporting
     ) throws {
-        if entry.isDirectory {
-            let dirURL = options.destination.appendingPathComponent(entry.name, isDirectory: true)
-            try fm.createDirectory(at: dirURL, withIntermediateDirectories: true)
-            return
-        }
+        guard !entry.isDirectory, let outputPath else { return }
+        let outputURL = URL(fileURLWithPath: outputPath)
 
         reporter.willProcessFile(entry.name)
 
         let password = try resolver.resolveIfNeeded(isEncrypted: entry.isEncrypted) { candidate in
             (try? self.verifyPassword(candidate: candidate, for: entry)) ?? false
-        }
-
-        guard let outputURL = try resolveDestinationPath(for: entry.name, options: options) else {
-            return // skip 策略
-        }
-        let parentDir = outputURL.deletingLastPathComponent()
-        if !fm.fileExists(atPath: parentDir.path) {
-            try fm.createDirectory(at: parentDir, withIntermediateDirectories: true)
         }
 
         fm.createFile(atPath: outputURL.path, contents: nil)
@@ -532,7 +735,7 @@ public final class ZipReader {
     /// 校验某候选密码是否可用于该条目。AES 条目比对盐后的 2 字节口令校验值
     /// (PBKDF2 派生);ZipCrypto 条目解密 12 字节头比对校验字节。
     private func verifyPassword(candidate: String, for entry: ZipEntryInfo) throws -> Bool {
-        guard let offset = localOffsets[entry.index] else { return false }
+        guard let offset = localOffset(for: entry) else { return false }
         let handle = try FileHandle(forReadingFrom: archiveURL)
         defer { try? handle.close() }
 
@@ -613,7 +816,7 @@ public final class ZipReader {
         output: FileHandle?,
         reporter: ArchiveProgressReporting
     ) throws {
-        guard let offset = localOffsets[entry.index] else {
+        guard let offset = localOffset(for: entry) else {
             throw ZipError.corruptEntry(reason: "缺少条目定位信息")
         }
         let handle = try FileHandle(forReadingFrom: archiveURL)
@@ -622,6 +825,7 @@ public final class ZipReader {
         let header = try readLocalHeader(offset: offset, handle: handle)
         // 累计值 → 增量的换算器 (zlib 流回报累计输出,store 分支回报累计写入)。
         let counter = ProgressAccumulator { delta in reporter.advance(by: UInt64(delta)) }
+        defer { counter.flush() }
 
         // WinWin AES 条目 (本地头 method 99 + extra 0x9901) 走独立解密管线。
         if let aes = header.aes {
@@ -676,7 +880,7 @@ public final class ZipReader {
                         try ChunkedIO.write(fd: outFD, from: UnsafeRawBufferPointer(start: chunkStart, count: chunkCount))
                     }
                     written += UInt64(chunkCount)
-                    counter.add(Int(written))
+                    counter.add(written)
                 }
             }
             guard crc == entry.crc else { throw ZipError.corruptEntry(reason: "store 条目 CRC 不符") }
@@ -712,7 +916,7 @@ public final class ZipReader {
                 let result = try ZlibCodec.inflateStream(
                     compressedSize: payloadSize,
                     to: output,
-                    progress: { counter.add(Int($0)) },
+                    progress: { counter.add($0) },
                     isCancelled: { [reporter] in reporter.isCancelled }
                 ) { buffer in
                     // 外层按剩余压缩量给出缓冲,剩余量与缓冲大小同步递减,
@@ -734,14 +938,21 @@ public final class ZipReader {
                       map.matches(uncompressedSize: entry.uncompressedSize) {
                 // 自研分块并行:各块独立解压 (本地头块图为准,段长合计须与负载吻合),
                 // 加密条目不走此路径 (ZipCrypto 密钥流不可寻址,上方串行分支处理)。
-                let crc = try inflateParallel(entry, header: header, map: map, output: output, reporter: reporter)
+                let crc = try inflateParallel(
+                    entry,
+                    header: header,
+                    map: map,
+                    output: output,
+                    reporter: reporter,
+                    counter: counter
+                )
                 guard crc == entry.crc else { throw ZipError.corruptEntry(reason: "CRC 校验失败") }
             } else {
                 let result = try ZlibCodec.inflateFile(
                     input: handle,
                     compressedSize: payloadSize,
                     to: output,
-                    progress: { counter.add(Int($0)) },
+                    progress: { counter.add($0) },
                     isCancelled: { [reporter] in reporter.isCancelled }
                 )
                 guard result.crc == entry.crc else { throw ZipError.corruptEntry(reason: "CRC 校验失败") }
@@ -802,7 +1013,7 @@ public final class ZipReader {
             let result = try ZlibCodec.inflateStream(
                 compressedSize: UInt64(cipherLen),
                 to: output,
-                progress: { counter.add(Int($0)) },
+                progress: { counter.add($0) },
                 isCancelled: { [reporter] in reporter.isCancelled }
             ) { buffer in
                 let want = buffer.count
@@ -844,7 +1055,7 @@ public final class ZipReader {
                         )
                     }
                     written += UInt64(want)
-                    counter.add(Int(written))
+                    counter.add(written)
                 }
             }
             if aes.version == WinZipAES.versionAE1 && entry.crc != 0 {
@@ -876,7 +1087,8 @@ public final class ZipReader {
         header: LocalHeaderInfo,
         map: ZipBlockMap,
         output: FileHandle?,
-        reporter: ArchiveProgressReporting
+        reporter: ArchiveProgressReporting,
+        counter: ProgressAccumulator
     ) throws -> UInt32 {
         let blockCount = map.segmentSizes.count
         let archive = try FileHandle(forReadingFrom: archiveURL)
@@ -915,6 +1127,7 @@ public final class ZipReader {
             group.enter()
             DispatchQueue.global(qos: .userInitiated).async { [reporter] in
                 defer { group.leave(); semaphore.signal() }
+                var pendingProgress: UInt64 = 0
                 do {
                     let outputOffset = UInt64(i) * map.blockSize
                     let expectedOutput = min(map.blockSize, entry.uncompressedSize - outputOffset)
@@ -927,12 +1140,24 @@ public final class ZipReader {
                         expectedOutput: expectedOutput,
                         isFinalSegment: i == blockCount - 1,
                         isCancelled: { [reporter] in reporter.isCancelled },
-                        onOutputProduced: { [reporter] bytes in reporter.advance(by: bytes) }
+                        onOutputProduced: { bytes in
+                            pendingProgress += bytes
+                            if pendingProgress >= ProgressAccumulator.batchSize {
+                                counter.addDelta(pendingProgress)
+                                pendingProgress = 0
+                            }
+                        }
                     )
+                    if pendingProgress > 0 {
+                        counter.addDelta(pendingProgress)
+                    }
                     lock.lock()
                     crcs[i] = result.crc
                     lock.unlock()
                 } catch {
+                    if pendingProgress > 0 {
+                        counter.addDelta(pendingProgress)
+                    }
                     lock.lock()
                     if firstError == nil { firstError = error }
                     lock.unlock()
@@ -957,20 +1182,46 @@ public final class ZipReader {
 
 /// 累计值 → 增量换算器 (线程安全):接收累计字节数,向上回报增量。
 final class ProgressAccumulator {
-    private let emit: (Int) -> Void
-    private var lastValue = 0
+    static let batchSize: UInt64 = 4 * 1024 * 1024
+
+    private let emit: (UInt64) -> Void
+    private var lastValue: UInt64 = 0
+    private var pending: UInt64 = 0
     private let lock = NSLock()
 
-    init(emit: @escaping (Int) -> Void) {
+    init(emit: @escaping (UInt64) -> Void) {
         self.emit = emit
     }
 
-    func add(_ cumulative: Int) {
+    func add(_ cumulative: UInt64) {
         lock.lock()
-        let delta = cumulative - lastValue
-        lastValue = cumulative
+        let delta = cumulative >= lastValue ? cumulative - lastValue : 0
+        lastValue = max(lastValue, cumulative)
+        pending += delta
+        let shouldEmit = pending >= Self.batchSize
+        let value = shouldEmit ? pending : 0
+        if shouldEmit { pending = 0 }
         lock.unlock()
-        if delta > 0 { emit(delta) }
+        if value > 0 { emit(value) }
+    }
+
+    func addDelta(_ delta: UInt64) {
+        guard delta > 0 else { return }
+        lock.lock()
+        pending += delta
+        let shouldEmit = pending >= Self.batchSize
+        let value = shouldEmit ? pending : 0
+        if shouldEmit { pending = 0 }
+        lock.unlock()
+        if value > 0 { emit(value) }
+    }
+
+    func flush() {
+        lock.lock()
+        let value = pending
+        pending = 0
+        lock.unlock()
+        if value > 0 { emit(value) }
     }
 }
 
@@ -984,6 +1235,7 @@ final class PasswordResolver {
     private var cachedPassword: String?
     private var promptExhausted = false
     private let lock = NSLock()
+    private let promptLock = NSLock()
 
     init(explicit: String?, candidates: [String], prompt: ((String, Int) -> String?)?) {
         self.explicit = explicit
@@ -997,34 +1249,67 @@ final class PasswordResolver {
         verifier: (String) throws -> Bool
     ) throws -> String? {
         guard isEncrypted else { return nil }
-        lock.lock()
-        defer { lock.unlock() }
 
-        if let cached = cachedPassword {
+        // 密码验证可能包含文件 I/O 或 AES PBKDF2。不要把这些耗时操作放在
+        // 状态锁内,否则多文件加密归档会被全局串行化。
+        lock.lock()
+        let cached = cachedPassword
+        lock.unlock()
+
+        if let cached {
             if try verifier(cached) { return cached }
         }
         if let explicit, !explicit.isEmpty {
             if try verifier(explicit) {
+                lock.lock()
                 cachedPassword = explicit
+                lock.unlock()
                 return explicit
             }
         }
         for candidate in candidates where !candidate.isEmpty {
             if try verifier(candidate) {
+                lock.lock()
                 cachedPassword = candidate
+                lock.unlock()
                 return candidate
             }
         }
-        if let prompt, !promptExhausted {
-            defer { promptExhausted = true }
-            for round in 1...3 {
-                guard let entered = prompt("该压缩包已加密", round), !entered.isEmpty else {
-                    throw CancellationError()
-                }
-                if try verifier(entered) {
-                    cachedPassword = entered
-                    return entered
-                }
+
+        guard let prompt else {
+            throw ZipError.wrongPassword
+        }
+
+        // 同一归档只允许一个线程弹出密码提示。等待中的线程先重新检查
+        // 已缓存密码,避免前一个线程成功后再次打扰用户。
+        promptLock.lock()
+        defer { promptLock.unlock() }
+
+        lock.lock()
+        let promptAlreadyExhausted = promptExhausted
+        let cachedAfterWait = cachedPassword
+        lock.unlock()
+        if let cachedAfterWait, try verifier(cachedAfterWait) {
+            return cachedAfterWait
+        }
+        guard !promptAlreadyExhausted else {
+            throw ZipError.wrongPassword
+        }
+
+        defer {
+            lock.lock()
+            promptExhausted = true
+            lock.unlock()
+        }
+        for round in 1...3 {
+            guard let entered = prompt("该压缩包已加密", round), !entered.isEmpty else {
+                throw CancellationError()
+            }
+            if try verifier(entered) {
+                lock.lock()
+                cachedPassword = entered
+                lock.unlock()
+                return entered
             }
         }
         throw ZipError.wrongPassword
